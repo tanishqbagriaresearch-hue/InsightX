@@ -12,7 +12,7 @@ from datetime import datetime
 warnings.filterwarnings("ignore")
 
 MODEL_PATH   = "Phi-3-mini-4k-instruct-q4.gguf"
-CONTEXT_SIZE = 8192
+CONTEXT_SIZE = 4096
 GPU_LAYERS   = -1
 
 _df   = None
@@ -165,6 +165,15 @@ def needs_data(q):
     if any(k in ql for k in DATA_KW): return True
     return len(ql.split())>5
 
+STATS_KW = ["stats table","statistics table","generate stats","show stats","show statistics",
+            "full stats","dataset stats","data stats","show me stats","show me statistics",
+            "overview table","overview stats","key stats","all stats","complete stats",
+            "generate statistics","statistics overview","stats overview"]
+
+def wants_stats_table(q):
+    ql = q.lower().strip()
+    return any(k in ql for k in STATS_KW)
+
 def wants_chart(q):  return any(k in q.lower() for k in CHART_KW)
 def wants_table(q):  return any(k in q.lower() for k in TABLE_KW)
 def wants_report(q): return any(k in q.lower() for k in REPORT_KW)
@@ -215,6 +224,35 @@ def _direct_analytics(q_lower, df):
     amt = _amt(df) or "amount_inr"
     cat = detect_query_category(q_lower)
     tbl = None; nav = ""; labels=[]; values=[]; ctype="bar"; recs=[]
+
+    # ── CROSS-TAB: age group × device type (must intercept before category routing) ──
+    _has_age    = any(w in q_lower for w in ["age","age group","age_group"])
+    _has_device = any(w in q_lower for w in ["device","android","ios","web"])
+    if _has_age and _has_device and "sender_age_group" in df.columns and "device_type" in df.columns:
+        order = ["18-25","26-35","36-45","46-55","56+"]
+        devices = sorted(df["device_type"].dropna().unique().tolist())
+        ct = df.groupby(["sender_age_group","device_type"]).size().unstack(fill_value=0)
+        ct = ct.reindex(order, fill_value=0)
+        for d in devices:
+            if d not in ct.columns:
+                ct[d] = 0
+        ct = ct[devices]
+        rows = [[age] + [f"{int(ct.loc[age, d]):,}" for d in devices] for age in order if age in ct.index]
+        tbl = {"headers": ["Age Group"] + devices, "rows": rows}
+        total_by_age = ct.sum(axis=1)
+        top_age = total_by_age.idxmax()
+        top_device = ct.sum(axis=0).idxmax()
+        nav = (f"Transaction count by age group × device type. "
+               f"Most active: {top_age} age group ({int(total_by_age[top_age]):,} txns), "
+               f"most used device: {top_device}.")
+        labels = [a for a in order if a in ct.index]
+        values = [int(total_by_age.get(a, 0)) for a in labels]
+        recs = [
+            f"'{top_age}' is the most active age group — prioritise features and UX for this segment.",
+            f"'{top_device}' is the dominant device — ensure it receives the best app experience.",
+            "Cross-referencing age and device helps target marketing campaigns more precisely.",
+        ]
+        return tbl, nav, labels, values, ctype, recs
 
     # ── DESCRIPTIVE ──────────────────────────────────────────────────────────
     if cat == "descriptive":
@@ -458,7 +496,30 @@ def _direct_analytics(q_lower, df):
             labels=order; values=g.reindex(order).tolist()
             recs = [f"'{top}' drives P2P volume — target with P2P-specific features and referral incentives.",
                     "Consider peer group features (splitting, requests) for the dominant age segment."]
-        elif "device" in q_lower or "android" in q_lower or "ios" in q_lower:
+        elif ("age" in q_lower or "age group" in q_lower) and ("device" in q_lower or "android" in q_lower or "ios" in q_lower):
+            # Cross-tab: age group × device type
+            order = ["18-25","26-35","36-45","46-55","56+"]
+            devices = sorted(df["device_type"].dropna().unique().tolist())
+            ct = df.groupby(["sender_age_group","device_type"]).size().unstack(fill_value=0)
+            ct = ct.reindex(order, fill_value=0)
+            for d in devices:
+                if d not in ct.columns:
+                    ct[d] = 0
+            ct = ct[devices]
+            rows = [[age] + [f"{int(ct.loc[age, d]):,}" for d in devices] for age in order if age in ct.index]
+            tbl = {"headers": ["Age Group"] + devices, "rows": rows}
+            total_by_age = ct.sum(axis=1)
+            top_age = total_by_age.idxmax()
+            top_device = ct.sum(axis=0).idxmax()
+            nav = f"Transaction count by age group × device type. Most active: {top_age} age group, most used device: {top_device}."
+            labels = order
+            values = [int(total_by_age.get(a, 0)) for a in order]
+            recs = [
+                f"'{top_age}' is the most active age group — prioritise features and UX for this segment.",
+                f"'{top_device}' is the dominant device — ensure it receives the best app experience and fastest performance.",
+                "Cross-referencing age and device helps target marketing campaigns more precisely.",
+            ]
+        elif ("device" in q_lower or "android" in q_lower or "ios" in q_lower) and not ("age" in q_lower or "age group" in q_lower):
             g = df.groupby("device_type")["transaction_type"].value_counts().unstack(fill_value=0)
             rows = [[dev]+[f"{g.loc[dev,t]:,}" if t in g.columns else "0" for t in df["transaction_type"].unique()]
                     for dev in g.index]
@@ -604,7 +665,6 @@ def clean_and_fix_code(text):
 def run_analyst(user_query):
     df=get_df(); llm=get_llm()
     if df is None or llm is None: return None
-    # Resolve the actual amount column name from the dataframe — never guess
     amt=_amt(df)
     if amt is None:
         amt_candidates=[c for c in df.columns if "amount" in c.lower()]
@@ -623,9 +683,15 @@ def run_analyst(user_query):
         "- device_type: Android, iOS, Web\n"
         "- network_type: 4G, 5G, WiFi, 3G\n"
         "- sender_bank: SBI, HDFC, ICICI, Axis, PNB, Kotak, IndusInd, Yes Bank\n"
-        "- hour_of_day: 0-23 | day_of_week: Monday-Sunday | is_weekend: 0/1\n\n"
+        "- day_of_week: Monday-Sunday | is_weekend: 0/1\n\n"
         f"Write Python code to answer: \"{user_query}\"\n"
-        "Rules: 1. Use var df. Do NOT reload. 2. Last line MUST print(). 3. Pure Python only. 4. Rates: 2 decimal places.\n"
+        "Rules:\n"
+        "1. Use var df. Do NOT reload.\n"
+        "2. Last line MUST be print().\n"
+        "3. Pure Python only. Rates to 2 decimal places.\n"
+        "4. NEVER print a raw DataFrame or Series — always print formatted strings.\n"
+        "5. Use print(f'Label: {{value}}') or a for loop over rows.\n"
+        "6. NEVER use .to_string() or just print(df).\n"
         "<|end|>\n<|assistant|>\n```python\n"
     )
     out=llm(prompt,max_tokens=1024,stop=["```","<|end|>","<|user|>","<|system|>"],echo=False,temperature=0.1)
@@ -633,12 +699,10 @@ def run_analyst(user_query):
     if not raw.strip(): return None
     code=clean_and_fix_code(raw)
     if not code: return None
-    # Sanitize: replace hallucinated amount column names with the real one
     _wrong_amt_names=["amount_inr","amount_(inr)","amount","amt"]
     for wrong in _wrong_amt_names:
         if wrong!=amt:
             code=re.sub(rf"(['\"]){re.escape(wrong)}\1",f"\'{amt}\'",code)
-    # Validate df[] column references — bail if LLM hallucinated a column
     _col_refs=re.findall(r"df\[[\'\"]([^\'\"]+)[\'\"]\]",code)
     for col in _col_refs:
         if col not in df.columns:
@@ -660,22 +724,24 @@ def run_analyst(user_query):
     raw_out = buf.getvalue().strip()
     if not raw_out:
         return None
-    # Reject raw pandas describe() dumps (they contain "count", "mean", "std" etc. in a table-like block)
-    # and empty Series outputs like "Series([], ...)"
     _bad_patterns = [
-        r"Series\(\[\]",          # empty Series
-        r"dtype: (int|float|object|bool)",  # pandas dtype lines
-        r"\[(\d+) rows x \d+ columns\]",    # pandas shape summary
+        r"Series\(\[\]",
+        r"dtype: (int|float|object|bool)",
+        r"\[(\d+) rows x \d+ columns\]",
+        r"RangeIndex:",
+        r"Index\(\[",
     ]
     import re as _re
     for pat in _bad_patterns:
         if _re.search(pat, raw_out):
             return None
-    # Reject if output is mostly whitespace / index numbers (raw dataframe rows)
     lines = [l for l in raw_out.splitlines() if l.strip()]
     if lines and all(_re.match(r"^\d+\s+", l) for l in lines[:3]):
-        # Looks like raw df.to_string() index output — reject
         return None
+    if lines and len(lines) > 1:
+        all_idx = all(_re.match(r"^\s*\d+\s+\S", l) for l in lines)
+        if all_idx:
+            return None
     return raw_out
 
 STOP_TOKENS=["<|end|>","<|user|>","<|system|>","<|assistant|>",
@@ -874,13 +940,22 @@ def run_narrator(user_query, data_result, recommendations, tab="Default", tbl=No
         "exact figure needed", "exact figures needed", "to be determined",
         "cooking up", "cooked by", "written by insightx", "(exact figure",
         " x%", " y%", " z%", " a%", " b%",
+        "[insert", "[add", "[placeholder", "[previous response",
+        "from previous response", "insert full", "insert table",
+        "insert the", "[data]", "[table]", "[chart]",
+        "as mentioned earlier", "as stated before", "as shown above",
+        "refer to previous", "see above",
     ]
     is_hallucinating = any(m in llm_answer.lower() for m in hallucination_markers)
     is_vague = any(phrase in llm_answer.lower() for phrase in [
         "i cannot","i don't have","not available","based on the data provided",
         "the data shows","the analysis","considering the","it's advisable",
         "this figure exceeds","notably,","it is important","given this insight",
-        "this pattern suggests","it is worth","it should be noted"
+        "this pattern suggests","it is worth","it should be noted",
+        "certainly, here", "certainly here", "of course", "sure, here",
+        "i'd be happy", "i would be happy", "happy to help",
+        "let me provide", "let me explain", "let me show",
+        "please note", "please be aware",
     ])
 
     # For comparative queries, check that LLM mentioned multiple categories (not just 1)
@@ -900,21 +975,107 @@ def run_narrator(user_query, data_result, recommendations, tab="Default", tbl=No
     if pandas_answer and (is_too_short or not has_numbers or is_vague or is_hallucinating or is_incomplete_comparative):
         return pandas_answer
 
-    return llm_answer or pandas_answer or "I couldn't generate a response. Try rephrasing."
+    if llm_answer and not (is_too_short or is_hallucinating or is_vague or is_incomplete_comparative):
+        return llm_answer
+
+    if pandas_answer:
+        return pandas_answer
+
+    return "⚠ Insufficient compute — model failed to generate a valid response in 3 attempts. Please rephrase your query or try a more specific question."
+
+def _expand_dict_value(key, val_str):
+    """
+    If val_str looks like a Python dict (e.g. "{'P2P': 112445, 'P2M': 87660}"),
+    parse it and return a list of [sub_key, sub_val] rows prefixed with the key,
+    or None if it's not a dict.
+    """
+    val_str = val_str.strip()
+    if not (val_str.startswith("{") and val_str.endswith("}")):
+        return None
+    try:
+        import ast
+        parsed = ast.literal_eval(val_str)
+        if not isinstance(parsed, dict):
+            return None
+        rows = []
+        for k, v in parsed.items():
+            if isinstance(v, float):
+                v_str = f"{v:,.2f}"
+            elif isinstance(v, int):
+                v_str = f"{v:,}"
+            else:
+                v_str = str(v)
+            rows.append([f"{key} — {k}", v_str])
+        return rows if rows else None
+    except Exception:
+        return None
+
 
 def format_as_table(data_result):
-    lines=[l for l in data_result.strip().splitlines() if l.strip()]
-    if not lines: return None
-    rows=[]
+    lines = [l for l in data_result.strip().splitlines() if l.strip()]
+    if not lines:
+        return None
+
+    def _strip_index(parts):
+        if parts and re.match(r"^\d+$", parts[0].strip()):
+            return parts[1:]
+        return parts
+
+    def _clean_val(v):
+        return v.strip()
+
+    # ── Phase 1: Try to detect a proper columnar table (2+ cols, first row = header) ──
+    rows = []
     for line in lines:
-        parts=re.split(r"\s{2,}|\t",line.strip())
-        if len(parts)>=2: rows.append(parts)
-    if rows and len(rows)>=2: return {"headers":rows[0],"rows":rows[1:]}
-    kv=[]
+        parts = re.split(r"\t|\s{2,}", line.strip())
+        parts = [_clean_val(p) for p in parts if p.strip()]
+        parts = _strip_index(parts)
+        if len(parts) >= 2:
+            rows.append(parts)
+
+    if rows and len(rows) >= 2:
+        max_cols = max(len(r) for r in rows)
+        header = rows[0]
+        if len(header) < max_cols:
+            header = header + [f"Col{i+1}" for i in range(len(header), max_cols)]
+        data_rows = []
+        for r in rows[1:]:
+            if len(r) < max_cols:
+                r = r + [""] * (max_cols - len(r))
+            data_rows.append(r[:max_cols])
+        # Check if any value looks like a dict — if so fall through to KV expansion
+        has_dict_vals = any(
+            str(cell).strip().startswith("{") and str(cell).strip().endswith("}")
+            for row in data_rows for cell in row
+        )
+        if not has_dict_vals:
+            return {"headers": header[:max_cols], "rows": data_rows}
+
+    # ── Phase 2: Key-value table (Metric | Value), expanding dicts into sub-rows ──
+    kv = []
     for line in lines:
-        parts=re.split(r"\s{2,}|\t|:\s*",line.strip(),maxsplit=1)
-        if len(parts)==2: kv.append(parts)
-    if kv: return {"headers":["Metric","Value"],"rows":kv}
+        # Try splitting on colon or tab or 2+ spaces
+        parts = re.split(r"\t|\s{2,}", line.strip(), maxsplit=1)
+        if len(parts) < 2:
+            parts = re.split(r":\s*", line.strip(), maxsplit=1)
+        parts = [_clean_val(p) for p in parts if p.strip()]
+        parts = _strip_index(parts)
+        if len(parts) == 2:
+            key, val = parts[0], parts[1]
+            # Attempt to expand dict-format values into multiple rows
+            expanded = _expand_dict_value(key, val)
+            if expanded:
+                kv.extend(expanded)
+            else:
+                # Truncate extremely long values with ellipsis — they'll still be readable
+                kv.append([key, val])
+        elif len(parts) == 1 and kv:
+            # Continuation line — append to last value
+            kv[-1][1] = kv[-1][1] + " " + parts[0]
+
+    if kv:
+        return {"headers": ["Metric", "Value"], "rows": kv}
+
     return None
 
 def detect_table_worthy(d):
@@ -1011,13 +1172,15 @@ def _draw_line(ax, fig, labels, values, title="", ylabel=""):
         _safe_tight_layout(fig)
         fig._hover_type = None; fig._hover_data = []
         return fig
-    # Guard: ensure values are numeric
+    # Guard: ensure values are numeric plain floats
     safe_values = []
     for _v in values:
         try:
             safe_values.append(float(_v))
         except (TypeError, ValueError):
             safe_values.append(0.0)
+    # Guard: ensure labels are plain strings (avoid matplotlib format-string misparse)
+    labels = [str(l) for l in labels]
     ax.plot(range(len(labels)), safe_values, color=PS["accent"], linewidth=2.5,
             marker="o", markersize=6, markerfacecolor=PS["a2"],
             label=ylabel or "Value")
@@ -1068,7 +1231,29 @@ def _draw_grouped_bar(fig, ax, group_labels, series_dict, title="", ylabel=""):
     return fig
 
 # ── main chart dispatch ───────────────────────────────────────────────────────
+def _unsupported_chart_fig(reason=""):
+    """Return a figure that clearly explains why a chart can't be drawn."""
+    fig, ax = _make_fig()
+    msg = reason or "This chart type isn't supported for the selected data."
+    ax.text(0.5, 0.6, "Chart unavailable", ha="center", va="center",
+            color=PS["accent"], fontsize=13, fontweight="bold",
+            transform=ax.transAxes)
+    ax.text(0.5, 0.42, msg, ha="center", va="center",
+            color=PS["fg"], fontsize=9, wrap=True,
+            transform=ax.transAxes)
+    ax.axis("off")
+    fig._hover_type = None; fig._hover_data = []
+    return fig
+
 def generate_chart(user_query, data_result):
+    try:
+        return _generate_chart_inner(user_query, data_result)
+    except Exception as ex:
+        return _unsupported_chart_fig(
+            f"Unable to generate this chart: {str(ex)[:120]}"
+        )
+
+def _generate_chart_inner(user_query, data_result):
     df=get_df(); q=user_query.lower(); amt=_amt(df) or "amount_inr"
     chart_type="bar"
     if "pie" in q: chart_type="pie"
@@ -1076,8 +1261,19 @@ def generate_chart(user_query, data_result):
     labels=[]; values=[]; title=user_query[:58]+("..." if len(user_query)>58 else "")
 
     if any(w in q for w in ["fraud","flag","flagged","review"]):
-        c=df["fraud_flag"].value_counts().sort_index()
-        labels=["Not Flagged","Flagged for Review"]; values=[int(c.get(0,0)),int(c.get(1,0))]; chart_type="pie"
+        # If asking for breakdown by type/bank/device, show rates per group
+        if any(w in q for w in ["breakdown","by type","by transaction","by bank","by device","by network"]):
+            g = df.groupby("transaction_type")["fraud_flag"].mean() * 100
+            g = g.sort_values(ascending=False)
+            labels = g.index.tolist()
+            values = [round(float(v), 4) for v in g.values]
+            # chart_type stays as set above (pie if user asked, else bar)
+        else:
+            # Simple flagged vs not-flagged count — good for pie
+            c = df["fraud_flag"].value_counts().sort_index()
+            labels = ["Not Flagged", "Flagged for Review"]
+            values = [int(c.get(0, 0)), int(c.get(1, 0))]
+            chart_type = "pie"  # sensible default for binary split
     elif any(w in q for w in ["status","success","fail","failed","failure"]) and not any(w in q for w in ["bank","device","network","age"]):
         c=df["transaction_status"].value_counts(); labels=c.index.tolist(); values=c.values.tolist()
     elif "transaction type" in q or "transaction_type" in q or (("type" in q or "p2p" in q or "p2m" in q or "recharge" in q or "bill" in q) and "bank" not in q):
@@ -1129,6 +1325,10 @@ def generate_chart(user_query, data_result):
     else:
         c=df["transaction_type"].value_counts(); labels=c.index.tolist(); values=c.values.tolist()
 
+    # Sanitise: plain Python types only — numpy scalars cause matplotlib _V errors
+    labels = [str(l) for l in labels]
+    values = [float(v) if not isinstance(v, int) else int(v) for v in values]
+
     fig,ax=_make_fig()
     if not values:
         ax.text(0.5,0.5,"Not enough data to chart",ha="center",va="center",
@@ -1139,7 +1339,43 @@ def generate_chart(user_query, data_result):
     else:                    return _draw_bar(ax,fig,labels,values,title)
 
 # ── Advanced Explorer: multi-variable chart builder ───────────────────────────
+def _unsupported_chart_fig(reason=""):
+    """Return a figure that clearly explains why a chart cannot be drawn."""
+    fig, ax = _make_fig()
+    msg = reason or "This chart type is not supported for the selected data."
+    ax.text(0.5, 0.62, "Chart unavailable", ha="center", va="center",
+            color=PS["accent"], fontsize=13, fontweight="bold",
+            transform=ax.transAxes)
+    # Word-wrap the reason manually (matplotlib text wrap is unreliable)
+    words = msg.split()
+    lines = []; line = ""
+    for w in words:
+        if len(line) + len(w) + 1 > 60:
+            lines.append(line); line = w
+        else:
+            line = (line + " " + w).strip()
+    if line: lines.append(line)
+    reason_text = "\n".join(lines)
+    ax.text(0.5, 0.38, reason_text, ha="center", va="center",
+            color=PS["fg"], fontsize=9,
+            transform=ax.transAxes)
+    ax.axis("off")
+    fig._hover_type = None; fig._hover_data = []
+    return fig
+
+
 def generate_explorer_chart(config):
+    """Public wrapper — never raises, always returns a Figure."""
+    try:
+        return _generate_explorer_chart_inner(config)
+    except Exception as ex:
+        return _unsupported_chart_fig(
+            "This combination of chart type and data columns cannot be visualised. "
+            "Try a different chart type or column selection."
+        )
+
+
+def _generate_explorer_chart_inner(config):
     """
     config = {
       "chart_type":  "bar"|"grouped_bar"|"line"|"pie"|"histogram"|"scatter"|"heatmap",
@@ -1525,6 +1761,113 @@ def save_chat_export(tab="Default"):
         lines.append("")
     return "\n".join(lines)
 
+def generate_stats_table(df):
+    """
+    Build a comprehensive, perfectly-formatted stats table entirely from pandas.
+    No LLM involved — zero risk of failure or truncation.
+    Returns {"headers": [...], "rows": [...]} ready for the UI renderer.
+    """
+    amt = _amt(df) or "amount_inr"
+    rows = []
+
+    # ── Dataset basics ────────────────────────────────────────────────────────
+    total = len(df)
+    rows.append(["📊 Total Transactions", f"{total:,}"])
+
+    if "transaction_status" in df.columns:
+        suc  = (df["transaction_status"] == "SUCCESS").sum()
+        fail = (df["transaction_status"] == "FAILED").sum()
+        rows.append(["✅ Successful Transactions",  f"{suc:,}  ({suc/total*100:.2f}%)"])
+        rows.append(["❌ Failed Transactions",       f"{fail:,}  ({fail/total*100:.2f}%)"])
+        rows.append(["📉 Overall Failure Rate",      f"{fail/total*100:.2f}%"])
+
+    if "fraud_flag" in df.columns:
+        flagged = df["fraud_flag"].sum()
+        rows.append(["🚩 Flagged for Review",        f"{int(flagged):,}  ({flagged/total*100:.2f}%)"])
+
+    # ── Amount stats ──────────────────────────────────────────────────────────
+    if amt in df.columns:
+        a = df[amt]
+        rows.append(["─── Amount Statistics ───", ""])
+        rows.append(["💰 Total Volume (INR)",          f"₹{a.sum():,.0f}"])
+        rows.append(["📈 Average Amount (INR)",         f"₹{a.mean():,.2f}"])
+        rows.append(["📊 Median Amount (INR)",          f"₹{a.median():,.2f}"])
+        rows.append(["📏 Std Deviation (INR)",          f"₹{a.std():,.2f}"])
+        rows.append(["⬇ Min Amount (INR)",             f"₹{a.min():,.2f}"])
+        rows.append(["⬆ Max Amount (INR)",             f"₹{a.max():,.2f}"])
+        rows.append(["📐 90th Percentile (INR)",        f"₹{a.quantile(0.90):,.2f}"])
+
+    # ── Transaction type breakdown ────────────────────────────────────────────
+    if "transaction_type" in df.columns:
+        rows.append(["─── Transaction Types ───", ""])
+        for ttype, cnt in df["transaction_type"].value_counts().items():
+            fail_r = (df[df["transaction_type"]==ttype]["transaction_status"]=="FAILED").mean()*100
+            rows.append([f"  {ttype}", f"{cnt:,}  ({cnt/total*100:.1f}%)  |  fail: {fail_r:.2f}%"])
+
+    # ── Merchant category ─────────────────────────────────────────────────────
+    if "merchant_category" in df.columns:
+        rows.append(["─── Merchant Categories ───", ""])
+        mc_counts = df["merchant_category"].value_counts()
+        for mc, cnt in mc_counts.items():
+            rows.append([f"  {mc}", f"{cnt:,}  ({cnt/total*100:.1f}%)"])
+
+    # ── Sender banks ──────────────────────────────────────────────────────────
+    if "sender_bank" in df.columns:
+        rows.append(["─── Sender Banks ───", ""])
+        for bank, cnt in df["sender_bank"].value_counts().items():
+            fail_r = (df[df["sender_bank"]==bank]["transaction_status"]=="FAILED").mean()*100
+            rows.append([f"  {bank}", f"{cnt:,}  ({cnt/total*100:.1f}%)  |  fail: {fail_r:.2f}%"])
+
+    # ── Device types ──────────────────────────────────────────────────────────
+    if "device_type" in df.columns:
+        rows.append(["─── Device Types ───", ""])
+        for dev, cnt in df["device_type"].value_counts().items():
+            rows.append([f"  {dev}", f"{cnt:,}  ({cnt/total*100:.1f}%)"])
+
+    # ── Network types ─────────────────────────────────────────────────────────
+    if "network_type" in df.columns:
+        rows.append(["─── Network Types ───", ""])
+        for net, cnt in df["network_type"].value_counts().items():
+            fail_r = (df[df["network_type"]==net]["transaction_status"]=="FAILED").mean()*100
+            rows.append([f"  {net}", f"{cnt:,}  ({cnt/total*100:.1f}%)  |  fail: {fail_r:.2f}%"])
+
+    # ── Age groups ────────────────────────────────────────────────────────────
+    if "sender_age_group" in df.columns:
+        rows.append(["─── Sender Age Groups ───", ""])
+        order = ["18-25","26-35","36-45","46-55","56+"]
+        vc = df["sender_age_group"].value_counts()
+        for age in order:
+            cnt = vc.get(age, 0)
+            if cnt > 0:
+                avg_a = df[df["sender_age_group"]==age][amt].mean() if amt in df.columns else 0
+                rows.append([f"  {age}", f"{cnt:,}  ({cnt/total*100:.1f}%)  |  avg ₹{avg_a:,.0f}"])
+
+    # ── Day of week ───────────────────────────────────────────────────────────
+    if "day_of_week" in df.columns:
+        rows.append(["─── Day of Week ───", ""])
+        day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+        vc = df["day_of_week"].value_counts()
+        for day in day_order:
+            cnt = vc.get(day, 0)
+            if cnt > 0:
+                rows.append([f"  {day}", f"{cnt:,}  ({cnt/total*100:.1f}%)"])
+
+    # ── Weekend split ─────────────────────────────────────────────────────────
+    if "is_weekend" in df.columns:
+        wknd = df["is_weekend"].sum()
+        wkdy = total - wknd
+        rows.append(["📅 Weekday Transactions",  f"{int(wkdy):,}  ({wkdy/total*100:.1f}%)"])
+        rows.append(["🎉 Weekend Transactions",   f"{int(wknd):,}  ({wknd/total*100:.1f}%)"])
+
+    # ── Peak hour ─────────────────────────────────────────────────────────────
+    if "hour_of_day" in df.columns:
+        peak_h = df["hour_of_day"].value_counts().idxmax()
+        peak_c = df["hour_of_day"].value_counts().max()
+        rows.append(["⏰ Peak Transaction Hour",  f"{peak_h}:00  ({peak_c:,} txns)"])
+
+    return {"headers": ["Metric", "Value"], "rows": rows}
+
+
 def process_query(user_query, tab="Default"):
     result={"text":"","table":None,"chart":None,"report":None,"summary":None,
             "data_raw":None,"recommendations":None}
@@ -1538,6 +1881,30 @@ def process_query(user_query, tab="Default"):
         push_rich(tab,entry)
 
     sum_mode=wants_summary(user_query)
+
+    # ── Stats table shortcut — pure pandas, zero LLM, never fails ────────────
+    if wants_stats_table(user_query):
+        df = get_df()
+        if df is not None:
+            tbl = generate_stats_table(df)
+            recs = [
+                "High failure rates by transaction type indicate integration issues — prioritise third-party API monitoring.",
+                "Peak hour data helps plan infrastructure scaling for load surges.",
+                "Age group and device breakdowns help target UX improvements to the highest-volume segments.",
+            ]
+            text = (f"Here is a complete statistics overview of your dataset ({len(df):,} transactions). "
+                    f"The table covers transaction volumes, amounts, failure rates, device/network splits, "
+                    f"age groups, and temporal patterns — all computed directly from your data.")
+            result["table"] = tbl
+            result["recommendations"] = recs
+            result["text"] = text
+            _push(user_query, text, {"table": tbl, "recommendations": recs})
+            return result
+        else:
+            result["text"] = "No data loaded yet. Please load a dataset first."
+            _push(user_query, result["text"])
+            return result
+
     if sum_mode=="chat":
         result["summary"]=generate_chat_summary(tab)
         result["text"]="Here's a summary of our conversation so far."
@@ -1572,14 +1939,17 @@ def process_query(user_query, tab="Default"):
             if t: result["table"]=t
 
     if wants_chart(user_query):
-        # Try to use direct analytics chart data first
-        if labels and values:
-            fig,ax=_make_fig()
-            if ctype=="pie": result["chart"]=_draw_pie(ax,fig,labels,values,user_query[:58])
-            elif ctype=="line": result["chart"]=_draw_line(ax,fig,labels,values,user_query[:58])
-            else: result["chart"]=_draw_bar(ax,fig,labels,values,user_query[:58])
-        else:
-            result["chart"]=generate_chart(user_query,data_raw or "")
+        try:
+            # Always route through generate_chart — it correctly maps the query
+            # to both the right data AND the right chart type (pie/line/bar).
+            # This prevents the direct-analytics labels (which may be raw means)
+            # from being drawn with the wrong chart type.
+            result["chart"] = generate_chart(user_query, data_raw or "")
+        except Exception:
+            result["chart"] = _unsupported_chart_fig(
+                "This chart type isn't available for the requested data. "
+                "Try asking for a bar chart or table instead."
+            )
 
     combined_data=nav if nav else (data_raw or "")
     text=run_narrator(user_query,combined_data,recs,tab,tbl=tbl) or "I couldn't generate a response. Try rephrasing."
