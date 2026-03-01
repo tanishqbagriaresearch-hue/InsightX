@@ -1087,8 +1087,9 @@ class InsightXApp(tk.Tk):
 
     def _zoom(self, direction):
         step = 0.10
+        # direction > 0 means zoom OUT (smaller), direction < 0 means zoom IN (bigger)
         new_zoom = round(self._zoom_level - direction * step, 2)
-        new_zoom = max(0.35, min(1.0, new_zoom))
+        new_zoom = max(0.40, min(2.0, new_zoom))
         if new_zoom == self._zoom_level:
             return
         self._zoom_level = new_zoom
@@ -1101,21 +1102,28 @@ class InsightXApp(tk.Tk):
         self._update_zoom_label()
 
     def _apply_zoom(self):
-        z = self._zoom_level
         import tkinter.font as tkfont
-        try:
+        z = self._zoom_level
+        # Store base sizes on first call so we always scale from the original
+        if not hasattr(self, "_base_font_sizes"):
+            self._base_font_sizes = {}
             for fname in tkfont.names(root=self):
+                try:
+                    fo = tkfont.Font(name=fname, exists=True, root=self)
+                    sz = fo.actual("size")
+                    if sz < 0:
+                        sz = abs(sz)
+                    if sz >= 6:
+                        self._base_font_sizes[fname] = sz
+                except Exception:
+                    pass
+        for fname, base_sz in self._base_font_sizes.items():
+            try:
                 fo = tkfont.Font(name=fname, exists=True, root=self)
-                base_size = fo.actual("size")
-                if base_size < 0:
-                    base_size = abs(base_size)
-                if base_size == 0:
-                    continue
-                if base_size >= 7:
-                    target = max(6, int(round(base_size * z / max(0.01, getattr(self, "_last_zoom", 1.0)))))
-                    fo.configure(size=target)
-        except Exception:
-            pass
+                target = max(6, int(round(base_sz * z)))
+                fo.configure(size=target)
+            except Exception:
+                pass
         self._last_zoom = z
 
     def _update_zoom_label(self):
@@ -1129,6 +1137,18 @@ class InsightXApp(tk.Tk):
         amt = linux_dir if linux_dir is not None else int(-1 * event.delta / 120)
         if amt == 0:
             return
+        # If event originated inside a child Toplevel (e.g. expanded table dialog),
+        # route scroll only to the widget under the cursor there — never the main canvas.
+        try:
+            top = event.widget.winfo_toplevel()
+            if top is not self:
+                try:
+                    event.widget.yview_scroll(amt, "units")
+                except Exception:
+                    pass
+                return "break"
+        except Exception:
+            pass
         if self._cursor_in_widget(event, self.sidebar):
             self._sb_canvas.yview_scroll(amt, "units")
             return "break"
@@ -1377,7 +1397,6 @@ class InsightXApp(tk.Tk):
             ("👤  Age Group Analysis", "compare average transaction amount by sender age group"),
             ("🛡  Flagged Review Analysis", "show fraud flag rate by transaction type table"),
             ("🗺  State Analysis", "show top 10 states by total transaction count table"),
-            ("📅  Weekend vs Weekday", "compare weekend vs weekday transaction stats"),
             ("💳  P2P vs P2M Analysis", "compare p2p vs p2m transaction amounts and counts"),
             ("📊  Merchant Revenue", "show total amount by merchant category table"),
             ("🔗  Age × Device Crosstab", "show transaction count by age group and device type"),
@@ -1392,13 +1411,11 @@ class InsightXApp(tk.Tk):
             ("📱  Device Flagged Rates", "show flagged for review rate by device type"),
             ("👤  Age Group Risk", "show flagged for review rate by sender age group"),
             ("🌍  State Risk Analysis", "show flagged rate by sender state table"),
-            ("📊  Risk Score Summary", "show a comprehensive risk summary with all flagged rates"),
         ]:
             self._sb_btn(lbl, query=q, pinnable=True)
 
         self._sec_hdr("ADVANCED INSIGHTS")
         for lbl, q in [
-            ("🌅  Morning vs Evening", "compare morning vs evening transaction patterns"),
             ("💵  High-Value Profiling", "show profile of high value transactions by bank and device"),
             ("🔄  Repeat Patterns", "show which transaction types have highest failure then retry rates"),
             ("🌐  Multi-Network Risk", "compare flagged rates across all network types and device combinations"),
@@ -1451,12 +1468,36 @@ class InsightXApp(tk.Tk):
         btn = tk.Label(row, text=display, font=("Consolas", 8),
                        fg=fg, bg=bg, anchor="w", padx=8, pady=4, cursor="hand2")
         btn.pack(side="left", fill="x", expand=True)
-        btn.bind("<Button-1>", lambda e, n=name: self._switch_tab(n))
+        btn.bind("<Button-1>", lambda e, n=name: self._tab_btn_click(e, n))
         btn.bind("<Double-Button-1>", lambda e, n=name: self._rename_tab_inline(n))
         btn.bind("<Enter>", lambda e, b=btn, n=name:
                  b.configure(bg=BG_HOVER if n != self._active_tab else BG_SELECTED))
         btn.bind("<Leave>", lambda e, b=btn, n=name:
                  b.configure(bg=BG_SELECTED if n == self._active_tab else BG_PANEL))
+
+        # ── Right-click context menu ──────────────────────────────────────────
+        def _show_ctx(e, n=name):
+            ctx = tk.Menu(self, tearoff=0, bg=BG_HOVER, fg=TEXT_PRIMARY,
+                          activebackground=ACCENT_BLUE, activeforeground=BG_DEEP,
+                          font=("Consolas", 8))
+            ctx.add_command(label="✏  Rename",
+                            command=lambda: self._rename_tab_inline(n))
+            ctx.add_command(label="⬇  Download Chat",
+                            command=lambda: self._download_tab_chat(n))
+            ctx.add_separator()
+            if n != "Default":
+                ctx.add_command(label="✕  Delete",
+                                command=lambda: self._delete_tab(n))
+            ctx.tk_popup(e.x_root, e.y_root)
+
+        btn.bind("<Button-3>", _show_ctx)
+        row.bind("<Button-3>", _show_ctx)
+
+        # ── Drag-to-reorder ───────────────────────────────────────────────────
+        btn.bind("<ButtonPress-1>",   lambda e, n=name: self._drag_start(e, n))
+        btn.bind("<B1-Motion>",       lambda e, n=name: self._drag_motion(e, n))
+        btn.bind("<ButtonRelease-1>", lambda e, n=name: self._drag_end(e, n))
+
         notes_count = len(_load_notes().get(name, "").strip())
         if notes_count > 0:
             tk.Label(row, text="📝", font=("Consolas", 7), fg=ACCENT_YELLOW,
@@ -1467,6 +1508,68 @@ class InsightXApp(tk.Tk):
             d.pack(side="right")
             d.bind("<Button-1>", lambda e, n=name: self._delete_tab(n))
         self._tab_buttons[name] = btn
+
+    def _tab_btn_click(self, event, name):
+        """Single click: switch tab (drag_end handles whether it was a drag or click)."""
+        if not getattr(self, "_was_dragged", False):
+            self._switch_tab(name)
+        self._was_dragged = False
+
+    def _drag_start(self, event, name):
+        self._drag_tab_name = name
+        self._drag_origin_y = event.y_root
+        self._was_dragged   = False
+
+    def _drag_motion(self, event, name):
+        if getattr(self, "_drag_tab_name", None) != name:
+            return
+        if abs(event.y_root - getattr(self, "_drag_origin_y", event.y_root)) > 6:
+            self._was_dragged = True
+            btn = self._tab_buttons.get(name)
+            if btn:
+                btn.configure(bg="#2d4a6e")
+
+    def _drag_end(self, event, name):
+        if getattr(self, "_drag_tab_name", None) != name:
+            return
+        self._drag_tab_name = None
+        if not self._was_dragged:
+            return  # handled by _tab_btn_click
+        # Find which tab the cursor is hovering over
+        target = None
+        for tname, tbtn in self._tab_buttons.items():
+            try:
+                bx = tbtn.winfo_rootx()
+                by = tbtn.winfo_rooty()
+                bw = tbtn.winfo_width()
+                bh = tbtn.winfo_height()
+                if by <= event.y_root <= by + bh:
+                    target = tname
+                    break
+            except Exception:
+                continue
+        if target and target != name:
+            tabs = engine.list_tabs()
+            if name in tabs and target in tabs:
+                ni, ti = tabs.index(name), tabs.index(target)
+                tabs.insert(ti, tabs.pop(ni))
+                new_chat = {t: engine.chat_tabs[t] for t in tabs}
+                new_rich = {t: engine.chat_rich[t] for t in tabs}
+                engine.chat_tabs.clear(); engine.chat_tabs.update(new_chat)
+                engine.chat_rich.clear(); engine.chat_rich.update(new_rich)
+        self._render_tab_list()
+
+    def _download_tab_chat(self, tab_name):
+        text = engine.save_chat_export(tab_name)
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text file", "*.txt"), ("Markdown", "*.md"), ("All files", "*.*")],
+            initialfile=f"insightx_{tab_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        )
+        if path:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            Toast.show(self, f"Chat saved: {os.path.basename(path)}")
 
     def _rename_tab_inline(self, old_name):
         new_name = simpledialog.askstring("Rename Chat",
@@ -1744,9 +1847,11 @@ class InsightXApp(tk.Tk):
         try:
             result = engine.process_query(query, self._active_tab)
             self._q.put(("result", result))
-        except Exception:
+        except Exception as _exc:
+            import traceback; traceback.print_exc()
             self._q.put(("result", {
                 "text": (
+                    f"⚠ Error: {_exc}\n\n"
                     "Sorry, I wasn't able to process that request. "
                     "Try rephrasing — for example: 'Show failure rate by bank' or "
                     "'What is the average transaction amount by device type?'"
@@ -2317,6 +2422,16 @@ class InsightXApp(tk.Tk):
         search_var.trace_add("write", _filter)
         _populate(rows)
 
+        # ── Isolated scroll — only scrolls this dialog's treeview ─────────────
+        def _dlg_wheel(e, d=None):
+            amt = d if d is not None else int(-1 * e.delta / 120)
+            tv.yview_scroll(amt, "units")
+            return "break"
+        for w in (tv, dlg, outer):
+            w.bind("<MouseWheel>", _dlg_wheel)
+            w.bind("<Button-4>",   lambda e: _dlg_wheel(e, -1))
+            w.bind("<Button-5>",   lambda e: _dlg_wheel(e,  1))
+
         # double-click copies cell
         def _on_dbl(e):
             item = tv.identify_row(e.y)
@@ -2547,7 +2662,12 @@ class InsightXApp(tk.Tk):
         self._scroll_bottom()
 
     def _new_tab(self):
-        name = f"Chat {len(engine.list_tabs()) + 1}"
+        existing = set(engine.list_tabs())
+        i = len(existing) + 1
+        name = f"Chat {i}"
+        while name in existing:
+            i += 1
+            name = f"Chat {i}"
         engine.create_tab(name)
         self._render_tab_list()
         self._switch_tab(name)

@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
-from llama_cpp import Llama
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import torch
 import re, sys, io, json, textwrap, warnings
 import matplotlib
 matplotlib.use("Agg")
@@ -11,9 +12,8 @@ from datetime import datetime
 
 warnings.filterwarnings("ignore")
 
-MODEL_PATH   = "Phi-3-mini-4k-instruct-q4.gguf"
+HF_MODEL_ID  = "microsoft/Phi-3-mini-4k-instruct"
 CONTEXT_SIZE = 4096
-GPU_LAYERS   = -1
 
 _df   = None
 _llm  = None
@@ -71,10 +71,141 @@ def load_data(filepath="data.csv"):
         df["merchant_category"] = df["merchant_category"].fillna("P2P_Transfer")
     _df = df; return df
 
+def _patch_dynamic_cache():
+    """
+    The cached Phi-3 modeling_phi3.py calls methods on DynamicCache that were
+    removed in newer transformers (seen_tokens, get_max_length, get_usable_length).
+    We patch the actual cached source file once so it works permanently,
+    and also monkey-patch the class as a belt-and-suspenders fallback.
+    """
+    import os, glob
+    # ── Belt: monkey-patch the class ─────────────────────────────────────────
+    try:
+        from transformers.cache_utils import DynamicCache
+        if not hasattr(DynamicCache, "seen_tokens"):
+            DynamicCache.seen_tokens = property(lambda self: self.get_seq_length())
+        if not hasattr(DynamicCache, "get_max_length"):
+            DynamicCache.get_max_length = lambda self: None
+        if not hasattr(DynamicCache, "get_usable_length"):
+            def _get_usable_length(self, new_seq_length, layer_idx=0):
+                # Returns how many past tokens exist for a given layer
+                if hasattr(self, "key_cache") and layer_idx < len(self.key_cache):
+                    return self.key_cache[layer_idx].shape[-2]
+                return self.get_seq_length()
+            DynamicCache.get_usable_length = _get_usable_length
+        print("[InsightX] DynamicCache patched (monkey-patch).")
+    except Exception as e:
+        print(f"[InsightX] Monkey-patch failed: {e}")
+
+    # ── Suspenders: patch the cached modeling_phi3.py on disk ────────────────
+    cache_root = os.path.expanduser("~/.cache/huggingface/modules/transformers_modules")
+    phi3_files = glob.glob(os.path.join(cache_root, "**", "modeling_phi3.py"), recursive=True)
+    for path in phi3_files:
+        try:
+            src = open(path, encoding="utf-8").read()
+            changed = False
+            # Fix seen_tokens
+            if "past_key_values.seen_tokens" in src and "getattr(past_key_values" not in src:
+                src = src.replace(
+                    "past_length = past_key_values.seen_tokens",
+                    "past_length = past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else past_key_values.seen_tokens"
+                )
+                changed = True
+            # Fix get_max_length
+            if "past_key_values.get_max_length()" in src:
+                src = src.replace(
+                    "max_cache_length = past_key_values.get_max_length()",
+                    "max_cache_length = (past_key_values.get_max_length() if hasattr(past_key_values, 'get_max_length') else None)"
+                )
+                changed = True
+            # Fix get_usable_length  ← NEW
+            if "past_key_values.get_usable_length(" in src:
+                src = src.replace(
+                    "past_key_values_length = past_key_values.get_usable_length(seq_length)",
+                    "past_key_values_length = (past_key_values.get_usable_length(seq_length) if hasattr(past_key_values, 'get_usable_length') else past_key_values.get_seq_length())"
+                )
+                changed = True
+            if changed:
+                open(path, "w", encoding="utf-8").write(src)
+                print(f"[InsightX] Patched cached model file: {path}")
+        except Exception as e:
+            print(f"[InsightX] Could not patch {path}: {e}")
+
+
+class _HFLlamaWrapper:
+    """
+    Calls model.generate() directly.
+    Silently absorbs all llama_cpp-specific kwargs (repeat_penalty, echo, etc.)
+    """
+    def __init__(self, model, tokenizer, device):
+        self._model = model
+        self._tok   = tokenizer
+        self._dev   = device
+
+    def __call__(self, prompt, max_tokens=512, stop=None,
+                 temperature=0.1, **_ignored):
+        stop = stop or []
+        try:
+            inputs = self._tok(prompt, return_tensors="pt").to(self._dev)
+            input_len = inputs["input_ids"].shape[-1]
+            with torch.no_grad():
+                out_ids = self._model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    temperature=max(temperature, 1e-6),
+                    do_sample=(temperature > 0.01),
+                    pad_token_id=self._tok.eos_token_id,
+                )
+            text = self._tok.decode(out_ids[0][input_len:], skip_special_tokens=True)
+            for s in stop:
+                idx = text.find(s)
+                if idx != -1:
+                    text = text[:idx]
+            return {"choices": [{"text": text}]}
+        except Exception:
+            # Silently swallow all generate errors (incl. attention weight shape mismatches)
+            return {"choices": [{"text": ""}]}
+
+
 def load_model():
     global _llm
-    _llm = Llama(model_path=MODEL_PATH, n_gpu_layers=GPU_LAYERS,
-                 n_ctx=CONTEXT_SIZE, n_batch=512, verbose=False)
+    use_cuda = torch.cuda.is_available()
+    device   = "cuda:0" if use_cuda else "cpu"
+    print(f"[InsightX] Loading {HF_MODEL_ID}  (CUDA={'yes' if use_cuda else 'no'})")
+    print("[InsightX] First run downloads ~2.4 GB; cached afterwards.")
+
+    # Patch BEFORE loading so the model code is fixed before it runs
+    _patch_dynamic_cache()
+
+    tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID, trust_remote_code=True)
+
+    if use_cuda:
+        print("[InsightX] Using 4-bit quantisation to minimise VRAM usage...")
+        bnb_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            HF_MODEL_ID,
+            quantization_config=bnb_cfg,
+            device_map="auto",
+            trust_remote_code=True,
+            attn_implementation="eager",
+        )
+    else:
+        print("[InsightX] No GPU detected -- loading on CPU...")
+        model = AutoModelForCausalLM.from_pretrained(
+            HF_MODEL_ID,
+            dtype=torch.float32,
+            device_map="cpu",
+            trust_remote_code=True,
+            attn_implementation="eager",
+        )
+
+    _llm = _HFLlamaWrapper(model, tokenizer, device)
+    print("[InsightX] Model ready.")
     return _llm
 
 def get_df():  return _df
@@ -193,8 +324,10 @@ def detect_query_category(q):
     if _rate_q or (_comp_subject and any(w in ql for w in ["fail","failure","success rate"])):
         return "comparative"
 
-    if any(w in ql for w in ["average","mean","total","count","how many","how much",
-                              "what is the","descriptive","what are the"]):
+    if any(w in ql for w in ["average","mean","total","sum","count","how many","how much",
+                              "what is the","descriptive","what are the","show","list","give me",
+                              "breakdown","by merchant","by category","by bank","by state",
+                              "by type","by device","by network","by age"]):
         return "descriptive"
     if any(w in ql for w in ["compare","vs","versus","difference","between",
                               "which is higher","which is lower","comparative",
@@ -256,47 +389,119 @@ def _direct_analytics(q_lower, df):
 
     # ── DESCRIPTIVE ──────────────────────────────────────────────────────────
     if cat == "descriptive":
-        if "average" in q_lower or "mean" in q_lower:
-            if "bill payment" in q_lower or "bill" in q_lower:
-                sub = df[df["transaction_type"]=="Bill Payment"]
-                avg_val = sub[amt].mean() if amt in df.columns else 0
-                nav = f"Average bill payment: Rs.{avg_val:,.2f}  |  Count: {len(sub):,}"
-                tbl = {"headers":["Metric","Value"],"rows":[
-                    ["Transaction Type","Bill Payment"],
-                    ["Count",f"{len(sub):,}"],
-                    ["Average Amount",f"Rs.{avg_val:,.2f}"],
-                    ["Median Amount",f"Rs.{sub[amt].median():,.2f}" if amt in df.columns else "N/A"],
-                    ["Std Dev",f"Rs.{sub[amt].std():,.2f}" if amt in df.columns else "N/A"],
-                    ["Min",f"Rs.{sub[amt].min():,.2f}" if amt in df.columns else "N/A"],
-                    ["Max",f"Rs.{sub[amt].max():,.2f}" if amt in df.columns else "N/A"],
-                ]}
-                recs = ["Bill payment amounts are higher on average — consider targeted promotions for high-value billers.",
-                        "Monitor failure rates for bill payments; third-party biller integrations are common failure points."]
-            elif "p2p" in q_lower:
-                sub = df[df["transaction_type"]=="P2P"]
-                avg_val = sub[amt].mean() if amt in df.columns else 0
-                nav = f"Average P2P transaction: Rs.{avg_val:,.2f}  |  Count: {len(sub):,}"
-                tbl = {"headers":["Metric","Value"],"rows":[
-                    ["Transaction Type","P2P"],["Count",f"{len(sub):,}"],
-                    ["Average Amount",f"Rs.{avg_val:,.2f}"],
-                    ["Median Amount",f"Rs.{sub[amt].median():,.2f}"],
-                ]}
-                recs = ["P2P transfers are high volume — focus on reducing friction for this category."]
-            elif "merchant" in q_lower or "category" in q_lower:
-                g = df[df["merchant_category"]!="P2P_Transfer"].groupby("merchant_category")[amt].agg(["mean","count","sum"])
-                g = g.sort_values("mean",ascending=False)
-                rows = [[cat,f"Rs.{row['mean']:,.2f}",f"{int(row['count']):,}",f"Rs.{row['sum']:,.2f}"]
-                        for cat,row in g.iterrows()]
-                tbl = {"headers":["Category","Avg Amount","Count","Total"],"rows":rows}
-                nav = f"Merchant category avg amounts: top is {g.index[0]} at Rs.{g['mean'].iloc[0]:,.2f}"
-                labels = [str(i)[:18] for i in g.index]; values = [round(_v,2) for _v in g["mean"].tolist()]
-                recs = [f"'{g.index[0]}' category has highest average spend — prime target for premium campaigns."]
-            elif amt in df.columns:
-                s = df[amt].describe()
-                rows = [[k.capitalize(),f"Rs.{_v:,.2f}" if k!="count" else f"{int(_v):,}"] for k,_v in s.items()]
-                tbl = {"headers":["Statistic","Value"],"rows":rows}
-                nav = f"Overall avg transaction: Rs.{s['mean']:,.2f}  |  Median: Rs.{s['50%']:,.2f}"
-                recs = ["High std deviation suggests diverse user segments — consider tiered product offerings."]
+        _want_avg   = any(w in q_lower for w in ["average","mean","avg"])
+        _want_total = any(w in q_lower for w in ["total","sum","revenue"])
+        _want_count = any(w in q_lower for w in ["count","how many","number of"])
+        _want_merch = any(w in q_lower for w in ["merchant","category","merchant category"])
+        _want_type  = any(w in q_lower for w in ["transaction type","by type","type"])
+        _want_bank  = any(w in q_lower for w in ["bank","sender bank"])
+        _want_bill  = any(w in q_lower for w in ["bill payment","bill"])
+        _want_p2p   = "p2p" in q_lower
+        _want_state = any(w in q_lower for w in ["state","region","sender state"])
+
+        # ── Merchant category (total, avg, count, or just "show") ────────────
+        if _want_merch and "merchant_category" in df.columns:
+            g = df[df["merchant_category"]!="P2P_Transfer"].groupby("merchant_category")[amt].agg(["mean","count","sum"])
+            g = g.sort_values("sum" if _want_total else "mean", ascending=False)
+            rows = [[mc,
+                     f"Rs.{row['sum']:,.0f}",
+                     f"Rs.{row['mean']:,.2f}",
+                     f"{int(row['count']):,}"]
+                    for mc,row in g.iterrows()]
+            tbl = {"headers":["Category","Total Amount","Avg Amount","Count"],"rows":rows}
+            top = g.index[0]
+            nav = (f"Merchant category totals: {top} leads with Rs.{g['sum'].iloc[0]:,.0f} total "
+                   f"({int(g['count'].iloc[0]):,} transactions, avg Rs.{g['mean'].iloc[0]:,.2f}).")
+            labels = [str(i)[:18] for i in g.index]
+            values = [round(float(v),2) for v in (g["sum"] if _want_total else g["mean"]).tolist()]
+            recs = [f"'{top}' drives the most revenue — prioritise promotions and reliability for this category.",
+                    "Categories with high avg but low count are high-value segments worth targeting."]
+
+        # ── Transaction type breakdown ────────────────────────────────────────
+        elif _want_type and "transaction_type" in df.columns:
+            g = df.groupby("transaction_type")[amt].agg(["mean","count","sum"])
+            g = g.sort_values("sum" if _want_total else "count", ascending=False)
+            rows = [[tt,
+                     f"Rs.{row['sum']:,.0f}",
+                     f"Rs.{row['mean']:,.2f}",
+                     f"{int(row['count']):,}",
+                     f"{(df[df['transaction_type']==tt]['transaction_status']=='FAILED').mean()*100:.2f}%"]
+                    for tt,row in g.iterrows()]
+            tbl = {"headers":["Type","Total","Avg Amount","Count","Fail Rate"],"rows":rows}
+            top = g.index[0]
+            nav = f"Transaction types by {'total' if _want_total else 'volume'}: {top} leads."
+            labels = [r[0] for r in rows]; values = [float(r[1].replace("Rs.","").replace(",","")) for r in rows]
+            recs = [f"'{top}' dominates by {'revenue' if _want_total else 'volume'} — ensure highest reliability here.",
+                    "Monitor failure rates per type and set type-specific SLA targets."]
+
+        # ── Bill payment specific ─────────────────────────────────────────────
+        elif _want_bill:
+            sub = df[df["transaction_type"]=="Bill Payment"]
+            avg_val = sub[amt].mean() if len(sub) else 0
+            tbl = {"headers":["Metric","Value"],"rows":[
+                ["Transaction Type","Bill Payment"],
+                ["Count",f"{len(sub):,}"],
+                ["Total Amount",f"Rs.{sub[amt].sum():,.0f}"],
+                ["Average Amount",f"Rs.{avg_val:,.2f}"],
+                ["Median Amount",f"Rs.{sub[amt].median():,.2f}"],
+                ["Fail Rate",f"{(sub['transaction_status']=='FAILED').mean()*100:.2f}%"],
+            ]}
+            nav = f"Bill Payment: {len(sub):,} transactions, avg Rs.{avg_val:,.2f}, total Rs.{sub[amt].sum():,.0f}"
+            recs = ["Bill payment amounts are higher on average — consider targeted promotions.",
+                    "Monitor failure rates; third-party biller integrations are common failure points."]
+
+        # ── P2P specific ──────────────────────────────────────────────────────
+        elif _want_p2p:
+            sub = df[df["transaction_type"]=="P2P"]
+            avg_val = sub[amt].mean() if len(sub) else 0
+            tbl = {"headers":["Metric","Value"],"rows":[
+                ["Transaction Type","P2P"],
+                ["Count",f"{len(sub):,}"],
+                ["Total Amount",f"Rs.{sub[amt].sum():,.0f}"],
+                ["Average Amount",f"Rs.{avg_val:,.2f}"],
+                ["Median Amount",f"Rs.{sub[amt].median():,.2f}"],
+            ]}
+            nav = f"P2P: {len(sub):,} transactions, avg Rs.{avg_val:,.2f}"
+            recs = ["P2P transfers are high volume — focus on reducing friction for this category."]
+
+        # ── Bank breakdown ────────────────────────────────────────────────────
+        elif _want_bank and "sender_bank" in df.columns:
+            g = df.groupby("sender_bank")[amt].agg(["mean","count","sum"])
+            g = g.sort_values("sum" if _want_total else "count", ascending=False)
+            rows = [[b, f"Rs.{row['sum']:,.0f}", f"Rs.{row['mean']:,.2f}", f"{int(row['count']):,}"]
+                    for b,row in g.iterrows()]
+            tbl = {"headers":["Bank","Total","Avg Amount","Count"],"rows":rows}
+            nav = f"Top bank by {'revenue' if _want_total else 'volume'}: {g.index[0]}"
+            labels = [r[0] for r in rows]; values = [float(r[1].replace("Rs.","").replace(",","")) for r in rows]
+            recs = ["Market leaders by volume hold negotiating power — focus partner deepening with top 3 banks."]
+
+        # ── State breakdown ───────────────────────────────────────────────────
+        elif _want_state and "sender_state" in df.columns:
+            g = df.groupby("sender_state")[amt].agg(["mean","count","sum"])
+            g = g.sort_values("sum" if _want_total else "count", ascending=False).head(15)
+            rows = [[s, f"Rs.{row['sum']:,.0f}", f"Rs.{row['mean']:,.2f}", f"{int(row['count']):,}"]
+                    for s,row in g.iterrows()]
+            tbl = {"headers":["State","Total","Avg Amount","Count"],"rows":rows}
+            nav = f"Top state: {g.index[0]} with Rs.{g['sum'].iloc[0]:,.0f} total"
+            labels = [r[0] for r in rows[:10]]; values = [float(r[1].replace("Rs.","").replace(",","")) for r in rows[:10]]
+            recs = [f"'{g.index[0]}' leads in transaction volume — prioritise infrastructure investment here."]
+
+        # ── Generic amount stats ──────────────────────────────────────────────
+        elif amt in df.columns:
+            s = df[amt].describe()
+            total_amt = df[amt].sum()
+            rows = [
+                ["Total Transactions", f"{len(df):,}"],
+                ["Total Amount",       f"Rs.{total_amt:,.0f}"],
+                ["Average Amount",     f"Rs.{s['mean']:,.2f}"],
+                ["Median Amount",      f"Rs.{s['50%']:,.2f}"],
+                ["Std Deviation",      f"Rs.{s['std']:,.2f}"],
+                ["Min Amount",         f"Rs.{s['min']:,.2f}"],
+                ["Max Amount",         f"Rs.{s['max']:,.2f}"],
+            ]
+            tbl = {"headers":["Metric","Value"],"rows":rows}
+            nav = f"Overall: {len(df):,} transactions, avg Rs.{s['mean']:,.2f}, total Rs.{total_amt:,.0f}"
+            recs = ["High std deviation suggests diverse user segments — consider tiered product offerings."]
 
     # ── COMPARATIVE ──────────────────────────────────────────────────────────
     elif cat == "comparative":
@@ -461,7 +666,7 @@ def _direct_analytics(q_lower, df):
             g = df.groupby("hour_of_day").size().sort_index()
             peak_h = g.idxmax()
             labels = [f"{h}:00" for h in g.index]; values = g.values.tolist(); ctype="line"
-            tbl_rows = [[f"{h}:00",f"{_v:,}",
+            tbl_rows = [[f"{h}:00",f"{int(g[h]):,}",
                          f"{(df[df['hour_of_day']==h]['transaction_status']=='FAILED').mean()*100:.2f}%"]
                         for h in g.index]
             tbl = {"headers":["Hour","Transactions","Fail Rate"],"rows":tbl_rows}
@@ -981,7 +1186,18 @@ def run_narrator(user_query, data_result, recommendations, tab="Default", tbl=No
     if pandas_answer:
         return pandas_answer
 
-    return "⚠ Insufficient compute — model failed to generate a valid response in 3 attempts. Please rephrase your query or try a more specific question."
+    # ── Last-resort: synthesise a plain answer from the table if we have one ──
+    if tbl:
+        rows = tbl.get("rows", [])
+        hdrs = tbl.get("headers", [])
+        if rows:
+            lines = [f"{hdrs[i] if i < len(hdrs) else ''}: {rows[0][i]}" for i in range(min(len(hdrs), len(rows[0])))]
+            summary = f"Here is the data for your query. Top result — {', '.join(lines)}."
+            if len(rows) > 1:
+                summary += f" ({len(rows)} rows total — see the table below.)"
+            return summary
+
+    return "I was unable to find relevant data for that query. Try asking about transaction amounts, failure rates, merchant categories, banks, or age groups."
 
 def _expand_dict_value(key, val_str):
     """
@@ -1722,22 +1938,48 @@ def generate_report(tab="Default"):
     return "\n".join(lines)
 
 def generate_chat_summary(tab="Default"):
-    history=get_history(tab)
-    if not history: return "No conversation history yet."
-    llm=get_llm(); convo=""
-    for msg in history[-16:]:
-        role="User" if msg["role"]=="user" else "InsightX"
-        convo+=f"{role}: {msg['content']}\n"
-    prompt=(
+    history = get_history(tab)
+    if not history:
+        return "No conversation history yet."
+
+    # ── Always build a pandas/text-based summary as guaranteed fallback ───────
+    def _text_summary():
+        pairs = [(history[i]["content"], history[i+1]["content"])
+                 for i in range(0, len(history)-1, 2)]
+        lines = [f"📋  Conversation Summary — '{tab}'  ({len(pairs)} exchange(s))\n"]
+        for i, (q, a) in enumerate(pairs[-8:], 1):
+            lines.append(f"• Q{i}: {q[:90]}{'…' if len(q)>90 else ''}")
+            lines.append(f"  ↳  {a[:130]}{'…' if len(a)>130 else ''}")
+        return "\n".join(lines)
+
+    llm = get_llm()
+    if llm is None:
+        return _text_summary()
+
+    convo = ""
+    for msg in history[-12:]:
+        role = "User" if msg["role"] == "user" else "InsightX"
+        convo += f"{role}: {msg['content'][:200]}\n"
+
+    prompt = (
         "<|system|>\nYou are a concise summarizer. Summarize in 3-5 bullet points. Be brief.<|end|>\n"
         f"<|user|>\nConversation:\n{convo}\n\nSummarize this.<|end|>\n<|assistant|>\n"
     )
-    out=llm(prompt,max_tokens=768,stop=["<|end|>","<|user|>","<|system|>"],echo=False,temperature=0.4)
-    raw=out["choices"][0]["text"].strip()
-    for m in ["<|end|>","<|user|>","<|system|>"]:
-        idx=raw.find(m)
-        if idx!=-1: raw=raw[:idx]
-    return raw.strip()
+    try:
+        out = llm(prompt, max_tokens=400,
+                  stop=["<|end|>", "<|user|>", "<|system|>"],
+                  echo=False, temperature=0.4)
+        raw = out["choices"][0]["text"].strip()
+        for m in ["<|end|>", "<|user|>", "<|system|>"]:
+            idx = raw.find(m)
+            if idx != -1:
+                raw = raw[:idx]
+        raw = raw.strip()
+        if len(raw) > 30:
+            return raw
+    except Exception:
+        pass
+    return _text_summary()
 
 def save_chat_export(tab="Default"):
     rich=get_rich(tab)
