@@ -1,0 +1,25 @@
+# AI model — too large for git (2.4 GB)
+*.gguf
+*.bin
+*.safetensors
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# App data
+data.csv
+*.csv
+insightx_*.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# HuggingFace cache
+.cache/
